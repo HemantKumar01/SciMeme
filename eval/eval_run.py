@@ -1,4 +1,4 @@
-from eval.eval_metrics import Scores
+from SciMeme.eval.eval_metrics import Scores
 import yaml
 from openai import OpenAI
 

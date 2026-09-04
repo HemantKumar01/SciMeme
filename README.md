@@ -29,6 +29,8 @@ The system is designed to **translate dense academic insights into accessible, h
 | **Contrastive Generator** | Refines memes iteratively using feedback from prior best/worst generations. |
 | **Evaluation Agents** | Three LLM-as-judge evaluators for *Fidelity*, *Clarity*, and *Engagement*. |
 
+The web implementation also generates normalized text-box coordinates while producing each caption, then renders the winning meme locally with Pillow.
+
 ---
 
 ## 🧠 Evaluation Dimensions
@@ -80,6 +82,26 @@ Run Full Multi-Agent Meme Generation
 
 ```python SciMemeX.py --config_path config.yaml --output results/output.json```
 
+### Web application
+
+The web pipeline implements the new exploration–exploitation search directly from an uploaded PDF:
+
+1. PDF extraction, Innovative Reflections, and Concisio.
+2. Initial template selection, multimodal caption generation, and parallel fidelity/clarity/engagement evaluation.
+3. Up to six contrastive iterations. Every iteration reselects templates and uses the previous best/worst candidates plus critic feedback.
+4. All-time-best selection, final evaluation, and coordinate-aware local PNG rendering.
+
+Each search round uses one generation request for all selected images. Caption text and normalized `0..1000` placement coordinates are produced together. The API key is request-scoped and is never written to the JSON output.
+
+```bash
+python3 -m venv .venv-web
+source .venv-web/bin/activate
+pip install -r requirements-web.txt
+uvicorn webapp.app:app --reload
+```
+
+Open `http://127.0.0.1:8000`. The interface shows the current stage, progress, and final meme. Intermediate outputs remain collapsed but can be inspected or downloaded as one JSON file. Six iterations reproduce the paper's search depth; fewer iterations reduce API usage.
+
 
 ### 🧾 Example Output
 
@@ -91,7 +113,6 @@ Run Full Multi-Agent Meme Generation
     {"iteration": 1, "fidelity": 4.5, "clarity": 2.1, "engagement": 4.0, "average": 10.6}
   ]
 }
-
 
 
 

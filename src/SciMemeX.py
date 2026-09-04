@@ -5,8 +5,8 @@ import argparse
 import random
 import re
 from autogen import ConversableAgent, LLMConfig
-from utils.read_json import read_json
-from eval.eval_run import evaluate_meme, get_score
+from SciMeme.utils.read_json import read_json
+from SciMeme.eval.eval_run import evaluate_meme, get_score
 
 # ------------------------------
 # Parse config

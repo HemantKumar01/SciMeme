@@ -1,0 +1,11 @@
+# Match the intentionally minimal Cloud Build source context.
+**
+!Dockerfile
+!requirements-web.txt
+!webapp/
+!webapp/**
+webapp/**/__pycache__/
+webapp/**/*.py[cod]
+!data/
+data/*
+!data/meme_template_dataset.json
