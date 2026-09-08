@@ -1,21 +1,29 @@
 from __future__ import annotations
 
 import json
+import os
 import unittest
 from io import BytesIO
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pymupdf
 from PIL import Image
 
-from webapp.app import _is_text_model, _sort_models
+from webapp.app import BUILT_IN_MODELS, _bedrock_api_key, _is_text_model, _sort_models
 from webapp.pipeline import (
     PipelineError,
     _extract_sections,
+    _library_for_prompt,
+    _parse_json_object,
+    call_agent,
+    display_template_name,
     extract_pdf,
+    generate_candidate_batch,
     load_template_library,
     normalize_tsa_output,
     render_meme_image,
+    resolve_renderable_templates,
     run_pipeline_events,
 )
 
@@ -63,6 +71,43 @@ class ExtractionTests(unittest.TestCase):
 
 
 class TsaTests(unittest.TestCase):
+    def test_template_prompt_fits_llama_3_context(self) -> None:
+        self.assertLess(len(_library_for_prompt(load_template_library())), 30_000)
+
+    def test_extracts_json_after_reasoning_that_contains_braces(self) -> None:
+        result = _parse_json_object(
+            '<think>Compare {old} with {new}; then answer.</think>\n'
+            '{"selections":[{"template_name":"Drake Hotline Bling"}]}'
+        )
+        self.assertEqual(result["selections"][0]["template_name"], "Drake Hotline Bling")
+
+    def test_preserves_periods_that_are_part_of_template_names(self) -> None:
+        self.assertEqual(display_template_name("Buff Doge vs. Cheems"), "Buff Doge vs. Cheems")
+        self.assertEqual(display_template_name("Buff_Doge_vs._Cheems.jpg"), "Buff Doge vs. Cheems")
+
+    def test_resolves_legacy_truncated_template_name(self) -> None:
+        catalog = {
+            "buffdogevscheems": {
+                "template_id": "247375501",
+                "template_name": "Buff Doge vs. Cheems",
+                "image_url": "https://i.imgflip.com/43a45p.png",
+                "width": 937,
+                "height": 720,
+                "box_count": 2,
+            }
+        }
+        selections = [
+            {
+                "template_name": "Buff Doge vs",
+                "description": "Old versus new.",
+                "reasoning": "Direct comparison.",
+                "contrast_mapping": "Old and new map to the two dogs.",
+            }
+        ]
+        renderable, unavailable = resolve_renderable_templates(selections, catalog)
+        self.assertFalse(unavailable)
+        self.assertEqual(renderable[0]["template_name"], "Buff Doge vs. Cheems")
+
     def test_normalizes_exact_library_names(self) -> None:
         library = load_template_library()
         names = list(library)[:3]
@@ -233,6 +278,245 @@ class ModelFilterTests(unittest.TestCase):
 
     def test_preferred_models_sort_first(self) -> None:
         self.assertEqual(_sort_models(["gpt-z", "gpt-5.6-luna"])[0], "gpt-5.6-luna")
+
+    def test_built_in_models_and_environment_key(self) -> None:
+        self.assertEqual(
+            BUILT_IN_MODELS,
+            [
+                "zai.glm-5",
+                "qwen.qwen3-vl-235b-a22b-instruct",
+                "meta.llama3-70b-instruct-v1:0",
+            ],
+        )
+        with patch.dict(os.environ, {"OPEN_SOURCE_API_KEY": "server-secret"}, clear=False):
+            self.assertEqual(_bedrock_api_key(), "server-secret")
+
+
+class ChatAdapterTests(unittest.IsolatedAsyncioTestCase):
+    async def test_uses_converse_for_llama_3(self) -> None:
+        client = SimpleNamespace(
+            api_key="bedrock-secret",
+            base_url="https://bedrock-mantle.us-east-1.api.aws/v1/",
+        )
+        schema = {
+            "type": "object",
+            "properties": {"ok": {"type": "boolean"}},
+            "required": ["ok"],
+            "additionalProperties": False,
+        }
+        with patch(
+            "webapp.pipeline._bedrock_converse_completion",
+            new=AsyncMock(return_value='{"ok":true}'),
+        ) as converse:
+            output = await call_agent(
+                client,
+                model="meta.llama3-70b-instruct-v1:0",
+                instructions="Return JSON.",
+                user_input="Hello",
+                max_output_tokens=4_000,
+                response_schema=schema,
+            )
+        self.assertEqual(output, '{"ok":true}')
+        request = converse.await_args.kwargs
+        self.assertEqual(request["model"], "meta.llama3-70b-instruct-v1:0")
+        self.assertIn("JSON Schema", request["instructions"])
+
+    async def test_uses_chat_completions_for_built_in_models(self) -> None:
+        create = AsyncMock(
+            return_value=SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content='{"ok":true}'))]
+            )
+        )
+        client = SimpleNamespace(
+            base_url="https://bedrock-mantle.us-east-1.api.aws/v1/",
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create)),
+        )
+        output = await call_agent(
+            client,
+            model="zai.glm-5",
+            instructions="Answer briefly.",
+            user_input="Hello",
+            max_output_tokens=100,
+            response_schema={"type": "object"},
+        )
+        self.assertEqual(output, '{"ok":true}')
+        request = create.await_args.kwargs
+        self.assertEqual(request["model"], "zai.glm-5")
+        self.assertEqual(request["messages"][0]["role"], "system")
+        self.assertEqual(request["reasoning_effort"], "low")
+        self.assertEqual(request["response_format"]["type"], "json_schema")
+        self.assertEqual(request["response_format"]["json_schema"]["schema"], {"type": "object"})
+        self.assertTrue(request["response_format"]["json_schema"]["strict"])
+        self.assertNotIn("JSON Schema", request["messages"][0]["content"])
+
+    async def test_retries_empty_responses_with_exponential_backoff(self) -> None:
+        empty = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=""))])
+        success = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="Recovered"))])
+        create = AsyncMock(side_effect=[empty, empty, success])
+        client = SimpleNamespace(
+            base_url="https://bedrock-mantle.us-east-1.api.aws/v1/",
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create)),
+        )
+        with patch("webapp.pipeline.asyncio.sleep", new=AsyncMock()) as sleep:
+            output = await call_agent(
+                client,
+                model="zai.glm-5",
+                instructions="Answer briefly.",
+                user_input="Hello",
+                max_output_tokens=100,
+            )
+        self.assertEqual(output, "Recovered")
+        self.assertEqual(create.await_count, 3)
+        self.assertEqual([call.args[0] for call in sleep.await_args_list], [1.0, 2.0])
+
+    async def test_retries_unreadable_structured_responses(self) -> None:
+        unreadable = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="not json"))]
+        )
+        success = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content='{"ok":true}'))]
+        )
+        create = AsyncMock(side_effect=[unreadable, success])
+        client = SimpleNamespace(
+            base_url="https://bedrock-mantle.us-east-1.api.aws/v1/",
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create)),
+        )
+        with patch("webapp.pipeline.asyncio.sleep", new=AsyncMock()) as sleep:
+            output = await call_agent(
+                client,
+                model="zai.glm-5",
+                instructions="Return JSON.",
+                user_input="Hello",
+                max_output_tokens=100,
+                response_schema={"type": "object"},
+            )
+        self.assertEqual(output, '{"ok":true}')
+        sleep.assert_awaited_once_with(1.0)
+
+    async def test_retries_json_that_does_not_match_the_schema(self) -> None:
+        wrong_shape = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content='{"type":"object"}'))]
+        )
+        success = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content='{"selections":["A"]}'))]
+        )
+        create = AsyncMock(side_effect=[wrong_shape, success])
+        client = SimpleNamespace(
+            base_url="https://bedrock-mantle.us-east-1.api.aws/v1/",
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create)),
+        )
+        schema = {
+            "type": "object",
+            "properties": {
+                "selections": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 1,
+                    "items": {"type": "string", "enum": ["A"]},
+                }
+            },
+            "required": ["selections"],
+            "additionalProperties": False,
+        }
+        with patch("webapp.pipeline.asyncio.sleep", new=AsyncMock()) as sleep:
+            output = await call_agent(
+                client,
+                model="zai.glm-5",
+                instructions="Return JSON.",
+                user_input="Hello",
+                max_output_tokens=100,
+                response_schema=schema,
+            )
+        self.assertEqual(output, '{"selections":["A"]}')
+        sleep.assert_awaited_once_with(1.0)
+
+    async def test_retries_unclassified_provider_errors(self) -> None:
+        success = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="Recovered"))]
+        )
+        create = AsyncMock(side_effect=[RuntimeError("temporary provider failure"), success])
+        client = SimpleNamespace(
+            base_url="https://bedrock-mantle.us-east-1.api.aws/v1/",
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create)),
+        )
+        with patch("webapp.pipeline.asyncio.sleep", new=AsyncMock()) as sleep:
+            output = await call_agent(
+                client,
+                model="zai.glm-5",
+                instructions="Answer briefly.",
+                user_input="Hello",
+                max_output_tokens=100,
+            )
+        self.assertEqual(output, "Recovered")
+        sleep.assert_awaited_once_with(1.0)
+
+
+class GenerationInputTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self.template = {
+            "template_id": "247375501",
+            "template_name": "Buff Doge vs. Cheems",
+            "image_url": "https://i.imgflip.com/43a45p.png",
+            "width": 937,
+            "height": 720,
+            "box_count": 1,
+            "description": "Two dogs used for comparison.",
+            "contrast_mapping": "Old versus new.",
+            "tsa_reasoning": "Direct contrast.",
+        }
+        self.candidate_json = json.dumps(
+            {
+                "candidates": [
+                    {
+                        "template_name": "Buff Doge vs. Cheems",
+                        "text_boxes": [
+                            {
+                                "text": "Old versus new",
+                                "x": 40,
+                                "y": 40,
+                                "width": 920,
+                                "height": 180,
+                                "font_size": 28,
+                                "align": "center",
+                            }
+                        ],
+                        "generation_note": "Direct contrast.",
+                    }
+                ]
+            }
+        )
+
+    async def test_glm_uses_text_only_template_metadata(self) -> None:
+        client = SimpleNamespace(base_url="https://bedrock-mantle.us-east-1.api.aws/v1/")
+        with patch("webapp.pipeline.call_agent", new=AsyncMock(return_value=self.candidate_json)) as agent:
+            await generate_candidate_batch(
+                client,
+                model="zai.glm-5",
+                research_idea="Old versus new.",
+                templates=[self.template],
+                iteration=0,
+            )
+        content = agent.await_args.kwargs["user_input"][0]["content"]
+        self.assertFalse(any(item["type"] == "input_image" for item in content))
+
+    async def test_other_built_in_models_receive_inline_images(self) -> None:
+        source = BytesIO()
+        Image.new("RGB", (32, 32), "#777777").save(source, "PNG")
+        client = SimpleNamespace(base_url="https://bedrock-mantle.us-east-1.api.aws/v1/")
+        with (
+            patch("webapp.pipeline.download_template_image", new=AsyncMock(return_value=source.getvalue())),
+            patch("webapp.pipeline.call_agent", new=AsyncMock(return_value=self.candidate_json)) as agent,
+        ):
+            await generate_candidate_batch(
+                client,
+                model="qwen.qwen3-vl-235b-a22b-instruct",
+                research_idea="Old versus new.",
+                templates=[self.template],
+                iteration=0,
+            )
+        content = agent.await_args.kwargs["user_input"][0]["content"]
+        image_item = next(item for item in content if item["type"] == "input_image")
+        self.assertTrue(image_item["image_url"].startswith("data:image/png;base64,"))
 
 
 if __name__ == "__main__":

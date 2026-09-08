@@ -9,7 +9,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncIterator
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import httpx
 from openai import AsyncOpenAI
@@ -28,6 +28,15 @@ TEMPLATE_LIBRARY_PATH = Path(__file__).resolve().parents[1] / "data" / "meme_tem
 IMGFLIP_CATALOG_URL = "https://api.imgflip.com/get_memes"
 MAX_TEMPLATE_IMAGE_BYTES = 8 * 1024 * 1024
 MAX_SEARCH_ITERATIONS = 6
+MAX_AGENT_ATTEMPTS = 4
+AGENT_RETRY_BASE_SECONDS = 1.0
+BEDROCK_MANTLE_HOST_PREFIX = "bedrock-mantle."
+BEDROCK_GLM_MODEL = "zai.glm-5"
+BEDROCK_QWEN_VL_MODEL = "qwen.qwen3-vl-235b-a22b-instruct"
+BEDROCK_LLAMA_MODEL = "meta.llama3-70b-instruct-v1:0"
+BEDROCK_CONVERSE_MODELS = {BEDROCK_LLAMA_MODEL}
+TEXT_ONLY_BEDROCK_MODELS = {BEDROCK_GLM_MODEL, BEDROCK_LLAMA_MODEL}
+REASONING_BEDROCK_MODELS = {BEDROCK_GLM_MODEL, BEDROCK_QWEN_VL_MODEL}
 
 INNOVATION_SYSTEM_PROMPT = """You are a comparative research analyst. Your task is to deeply analyze a research paper to extract the main conceptual and technical differences between past work and this paper's contributions.
 
@@ -247,7 +256,8 @@ def load_template_library() -> dict[str, dict[str, str]]:
 
 
 def display_template_name(filename: str) -> str:
-    return re.sub(r"\s+", " ", filename.rsplit(".", 1)[0].replace("_", " ")).strip()
+    name = re.sub(r"\.(?:jpe?g|png|webp)$", "", filename.strip(), flags=re.IGNORECASE)
+    return re.sub(r"\s+", " ", name.replace("_", " ")).strip()
 
 
 def _canonical_template_name(value: str) -> str:
@@ -256,8 +266,15 @@ def _canonical_template_name(value: str) -> str:
 
 
 def _library_for_prompt(library: dict[str, dict[str, str]]) -> str:
+    def compact_description(value: str) -> str:
+        cleaned = _clean_text(value).replace("\n", " ")
+        if len(cleaned) <= 220:
+            return cleaned
+        shortened = cleaned[:220].rsplit(" ", 1)[0]
+        return shortened.rstrip(" ,;:-") + "…"
+
     return "\n\n".join(
-        f"TEMPLATE: {name}\nDESCRIPTION: {details['description']}"
+        f"TEMPLATE: {name}\nDESCRIPTION: {compact_description(details['description'])}"
         for name, details in library.items()
     )
 
@@ -306,7 +323,16 @@ def resolve_renderable_templates(
     unavailable: list[str] = []
     for selection in selections:
         name = selection["template_name"]
-        catalog_entry = catalog.get(_canonical_template_name(name))
+        canonical_name = _canonical_template_name(name)
+        catalog_entry = catalog.get(canonical_name)
+        if catalog_entry is None and len(canonical_name) >= 8:
+            prefix_matches = [
+                entry
+                for catalog_name, entry in catalog.items()
+                if catalog_name.startswith(canonical_name) or canonical_name.startswith(catalog_name)
+            ]
+            if len(prefix_matches) == 1:
+                catalog_entry = prefix_matches[0]
         if catalog_entry is None:
             unavailable.append(name)
             continue
@@ -486,6 +512,81 @@ def _candidate_payload(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]
         }
         for item in candidates
     ]
+
+
+def _uses_bedrock_endpoint(client: AsyncOpenAI) -> bool:
+    parsed = urlparse(str(client.base_url))
+    return bool(parsed.hostname and parsed.hostname.startswith(BEDROCK_MANTLE_HOST_PREFIX))
+
+
+def _bedrock_region(client: AsyncOpenAI) -> str:
+    hostname = urlparse(str(client.base_url)).hostname or ""
+    if hostname.startswith(BEDROCK_MANTLE_HOST_PREFIX):
+        return hostname.removeprefix(BEDROCK_MANTLE_HOST_PREFIX).removesuffix(".api.aws")
+    raise PipelineError("The Amazon Bedrock endpoint is invalid.")
+
+
+def _bedrock_user_text(user_input: Any) -> str:
+    if isinstance(user_input, str):
+        return user_input
+    parts: list[str] = []
+    for message in user_input:
+        for item in message.get("content", []):
+            if item.get("type") == "input_text":
+                parts.append(str(item.get("text", "")))
+    return "\n\n".join(part for part in parts if part)
+
+
+async def _bedrock_converse_completion(
+    client: AsyncOpenAI,
+    *,
+    model: str,
+    instructions: str,
+    user_input: Any,
+    max_output_tokens: int,
+) -> str:
+    api_key = getattr(client, "api_key", "")
+    if not isinstance(api_key, str) or not api_key:
+        raise PipelineError("The Amazon Bedrock API key is unavailable.")
+    region = _bedrock_region(client)
+    endpoint = (
+        f"https://bedrock-runtime.{region}.amazonaws.com/model/"
+        f"{quote(model, safe='')}/converse"
+    )
+    payload = {
+        "system": [{"text": instructions}],
+        "messages": [
+            {
+                "role": "user",
+                "content": [{"text": _bedrock_user_text(user_input)}],
+            }
+        ],
+        # Llama 3 70B supports at most 2,048 generated tokens.
+        "inferenceConfig": {"maxTokens": min(max_output_tokens, 2_048)},
+    }
+    async with httpx.AsyncClient(timeout=180.0) as http_client:
+        response = await http_client.post(
+            endpoint,
+            headers={"Authorization": f"Bearer {api_key}"},
+            json=payload,
+        )
+        response.raise_for_status()
+    try:
+        blocks = response.json()["output"]["message"]["content"]
+        return "\n".join(str(block["text"]) for block in blocks if "text" in block)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise _UnreadableAgentResponse(
+            f"Model {model} returned an unexpected Amazon Bedrock response."
+        ) from exc
+
+
+def _image_data_url(image_bytes: bytes) -> str:
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as image:
+            mime_type = Image.MIME.get(image.format or "", "image/jpeg")
+    except (OSError, ValueError) as exc:
+        raise PipelineError("A meme-template image could not be prepared for the selected model.") from exc
+    return f"data:{mime_type};base64," + base64.b64encode(image_bytes).decode("ascii")
 
 
 async def critique_candidates(
@@ -710,15 +811,29 @@ def _parse_json_object(raw: str) -> dict[str, Any]:
     try:
         value = json.loads(cleaned)
     except json.JSONDecodeError:
-        start, end = cleaned.find("{"), cleaned.rfind("}")
-        if start < 0 or end <= start:
-            raise PipelineError("An agent returned an unreadable response. Try another model.")
-        try:
-            value = json.loads(cleaned[start : end + 1])
-        except json.JSONDecodeError as exc:
-            raise PipelineError("An agent returned invalid JSON. Try another model.") from exc
+        # Some reasoning models can place analysis before the final answer. That
+        # analysis may itself contain braces, so slicing from the first opening
+        # brace to the last closing brace can turn a valid final object into
+        # invalid JSON. Decode at every object boundary and use the first complete
+        # JSON object instead.
+        decoder = json.JSONDecoder()
+        value = None
+        for match in re.finditer(r"\{", cleaned):
+            try:
+                candidate, _ = decoder.raw_decode(cleaned, match.start())
+            except json.JSONDecodeError:
+                continue
+            if isinstance(candidate, dict):
+                value = candidate
+                break
+        if value is None:
+            if "{" not in cleaned:
+                raise _UnreadableAgentResponse(
+                    "An agent returned an unreadable response. Try another model."
+                )
+            raise _UnreadableAgentResponse("An agent returned invalid JSON. Try another model.")
     if not isinstance(value, dict):
-        raise PipelineError("An agent returned an unexpected response shape.")
+        raise _UnreadableAgentResponse("An agent returned an unexpected response shape.")
     return value
 
 
@@ -765,6 +880,99 @@ def normalize_tsa_output(
     return normalized
 
 
+class _EmptyAgentResponse(PipelineError):
+    pass
+
+
+class _UnreadableAgentResponse(PipelineError):
+    pass
+
+
+def _matches_json_schema(value: Any, schema: dict[str, Any]) -> bool:
+    """Validate the JSON Schema subset used by this pipeline."""
+    expected_type = schema.get("type")
+    if expected_type == "object":
+        if not isinstance(value, dict):
+            return False
+        properties = schema.get("properties", {})
+        if any(key not in value for key in schema.get("required", [])):
+            return False
+        if schema.get("additionalProperties") is False and any(
+            key not in properties for key in value
+        ):
+            return False
+        return all(
+            key not in value or _matches_json_schema(value[key], child_schema)
+            for key, child_schema in properties.items()
+        )
+    if expected_type == "array":
+        if not isinstance(value, list):
+            return False
+        if len(value) < schema.get("minItems", 0) or len(value) > schema.get(
+            "maxItems", float("inf")
+        ):
+            return False
+        item_schema = schema.get("items")
+        return not item_schema or all(_matches_json_schema(item, item_schema) for item in value)
+    if expected_type == "string" and not isinstance(value, str):
+        return False
+    if expected_type == "integer" and (not isinstance(value, int) or isinstance(value, bool)):
+        return False
+    if expected_type == "number" and (
+        not isinstance(value, (int, float)) or isinstance(value, bool)
+    ):
+        return False
+    if expected_type == "boolean" and not isinstance(value, bool):
+        return False
+    return "enum" not in schema or value in schema["enum"]
+
+
+def _is_retryable_agent_error(exc: Exception) -> bool:
+    if isinstance(exc, (_EmptyAgentResponse, _UnreadableAgentResponse)):
+        return True
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+    if status in {400, 401, 403, 404, 422}:
+        return False
+    if status in {408, 409, 425, 429} or (isinstance(status, int) and status >= 500):
+        return True
+    if exc.__class__.__name__ in {
+        "APIConnectionError",
+        "APITimeoutError",
+        "InternalServerError",
+        "RateLimitError",
+    }:
+        return True
+    return status is None
+
+
+async def _request_agent_with_backoff(
+    operation: Any,
+    model: str,
+    *,
+    response_schema: dict[str, Any] | None = None,
+) -> str:
+    for attempt in range(MAX_AGENT_ATTEMPTS):
+        try:
+            output = await operation()
+            if not isinstance(output, str) or not output.strip():
+                raise _EmptyAgentResponse(f"Model {model} returned no text.")
+            if response_schema is not None:
+                parsed = _parse_json_object(output)
+                if not _matches_json_schema(parsed, response_schema):
+                    raise _UnreadableAgentResponse(
+                        f"Model {model} returned JSON that did not match the requested structure."
+                    )
+            return output.strip()
+        except Exception as exc:
+            is_last_attempt = attempt == MAX_AGENT_ATTEMPTS - 1
+            if is_last_attempt or not _is_retryable_agent_error(exc):
+                raise
+            await asyncio.sleep(AGENT_RETRY_BASE_SECONDS * (2**attempt))
+    raise AssertionError("Agent retry loop exited unexpectedly.")
+
+
 async def call_agent(
     client: AsyncOpenAI,
     *,
@@ -775,6 +983,81 @@ async def call_agent(
     response_schema: dict[str, Any] | None = None,
     schema_name: str = "agent_output",
 ) -> str:
+    if _uses_bedrock_endpoint(client):
+        chat_instructions = instructions
+        if model in BEDROCK_CONVERSE_MODELS:
+            if response_schema is not None:
+                chat_instructions += (
+                    "\n\nReturn only valid JSON matching this JSON Schema; do not use markdown fences:\n"
+                    + json.dumps(response_schema, ensure_ascii=False)
+                )
+
+            async def create_converse_completion() -> str:
+                return await _bedrock_converse_completion(
+                    client,
+                    model=model,
+                    instructions=chat_instructions,
+                    user_input=user_input,
+                    max_output_tokens=max_output_tokens,
+                )
+
+            return await _request_agent_with_backoff(
+                create_converse_completion,
+                model,
+                response_schema=response_schema,
+            )
+
+        messages: list[dict[str, Any]] = [{"role": "system", "content": chat_instructions}]
+        if isinstance(user_input, str):
+            messages.append({"role": "user", "content": user_input})
+        else:
+            for message in user_input:
+                converted_content: list[dict[str, Any]] = []
+                for item in message.get("content", []):
+                    if item.get("type") == "input_text":
+                        converted_content.append({"type": "text", "text": item["text"]})
+                    elif item.get("type") == "input_image":
+                        converted_content.append(
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": item["image_url"],
+                                    "detail": item.get("detail", "auto"),
+                                },
+                            }
+                        )
+                messages.append({"role": message.get("role", "user"), "content": converted_content})
+        async def create_chat_completion() -> str:
+            request: dict[str, Any] = {
+                "model": model,
+                "messages": messages,
+                "max_tokens": max_output_tokens,
+            }
+            if model in REASONING_BEDROCK_MODELS:
+                request["reasoning_effort"] = "low"
+            if response_schema is not None:
+                request["response_format"] = {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": schema_name,
+                        "description": "Structured output for the current SciMemeX pipeline stage.",
+                        "schema": response_schema,
+                        "strict": True,
+                    },
+                }
+            completion = await client.chat.completions.create(
+                **request,
+            )
+            if not completion.choices:
+                return ""
+            return completion.choices[0].message.content or ""
+
+        return await _request_agent_with_backoff(
+            create_chat_completion,
+            model,
+            response_schema=response_schema,
+        )
+
     request: dict[str, Any] = {
         "model": model,
         "instructions": instructions,
@@ -794,33 +1077,40 @@ async def call_agent(
                 "strict": True,
             }
         }
-    response = await client.responses.create(
-        **request,
+    async def create_response() -> str:
+        response = await client.responses.create(**request)
+        return response.output_text or ""
+
+    return await _request_agent_with_backoff(
+        create_response,
+        model,
+        response_schema=response_schema,
     )
-    output = response.output_text.strip()
-    if not output:
-        raise PipelineError(f"Model {model} returned no text.")
-    return output
 
 
 def _event(event: str, **payload: Any) -> str:
     return json.dumps({"event": event, **payload}, ensure_ascii=False) + "\n"
 
 
-def _friendly_api_error(exc: Exception) -> str:
+def _friendly_api_error(exc: Exception, *, open_source: bool = False) -> str:
     status = getattr(exc, "status_code", None)
+    if status is None:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+    service_name = "Amazon Bedrock" if open_source else "OpenAI"
+    if status == 400:
+        return f"{service_name} rejected the request. The selected model may not support the requested input."
     if status == 401:
-        return "OpenAI rejected the API key. Verify the key and project access, then try again."
+        return f"{service_name} rejected the API credentials. Verify the server configuration, then try again."
     if status == 403:
-        return "This OpenAI project is not allowed to use the selected model. Choose another model."
+        return f"{service_name} does not allow access to the selected model. Choose another model."
     if status == 404:
-        return "The selected model was not found for this OpenAI project. Reload the model list and try again."
+        return "The selected model was not found. Reload the model list and try again."
     if status == 429:
-        return "OpenAI rate or quota limits were reached. Wait briefly or check project billing, then retry."
+        return f"{service_name} rate or quota limits were reached. Wait briefly, then retry."
     if status and status >= 500:
-        return "OpenAI is temporarily unavailable. Try the run again in a moment."
+        return f"{service_name} is temporarily unavailable. Try the run again in a moment."
     if exc.__class__.__name__ in {"APIConnectionError", "APITimeoutError"}:
-        return "The OpenAI API could not be reached. Check the network connection and try again."
+        return f"{service_name} could not be reached. Check the network connection and try again."
     return "The model request failed. Verify the selected models and try again."
 
 
@@ -968,6 +1258,23 @@ async def generate_candidate_batch(
             + "\n\nWORST CANDIDATE AND NEGATIVE FEEDBACK:\n"
             + json.dumps(_feedback_candidate(worst), ensure_ascii=False, indent=2)
         )
+    bedrock_endpoint = _uses_bedrock_endpoint(client)
+    text_only_model = bedrock_endpoint and model in TEXT_ONLY_BEDROCK_MODELS
+    image_urls: list[str] = []
+    if bedrock_endpoint and not text_only_model:
+        image_bytes = await asyncio.gather(
+            *(download_template_image(template["image_url"]) for template in templates)
+        )
+        image_urls = [_image_data_url(contents) for contents in image_bytes]
+    elif not bedrock_endpoint:
+        image_urls = [template["image_url"] for template in templates]
+
+    image_guidance = (
+        "This model cannot inspect images. Infer practical caption placement from each template's "
+        "name, description, dimensions, and box count; keep every normalized box inside the image."
+        if text_only_model
+        else "Generate captions and normalized coordinates together by inspecting the corresponding images."
+    )
     content: list[dict[str, Any]] = [
         {
             "type": "input_text",
@@ -975,20 +1282,21 @@ async def generate_candidate_batch(
                 f"CORE RESEARCH CONTRAST:\n{research_idea}"
                 f"{feedback}\n\n"
                 "Create one candidate for every listed template. The text_boxes array must contain "
-                "exactly that template's box_count objects. Generate captions and normalized "
-                "coordinates together by inspecting the corresponding images.\n\n"
+                f"exactly that template's box_count objects. {image_guidance}\n\n"
                 "TEMPLATES:\n"
                 + json.dumps(template_data, ensure_ascii=False, indent=2)
             ),
         }
     ]
     for index, template in enumerate(templates, start=1):
-        content.extend(
-            [
-                {"type": "input_text", "text": f"IMAGE {index}: {template['template_name']}"},
-                {"type": "input_image", "image_url": template["image_url"], "detail": "high"},
-            ]
+        content.append(
+            {
+                "type": "input_text",
+                "text": f"{'TEMPLATE' if text_only_model else 'IMAGE'} {index}: {template['template_name']}",
+            }
         )
+        if image_urls:
+            content.append({"type": "input_image", "image_url": image_urls[index - 1], "detail": "high"})
     raw = await call_agent(
         client,
         model=model,
@@ -1025,6 +1333,7 @@ async def run_pipeline_events(
     pdf_bytes: bytes,
     filename: str,
     api_key: str,
+    base_url: str | None = None,
     innovation_model: str,
     concisio_model: str,
     tsa_model: str,
@@ -1050,7 +1359,7 @@ async def run_pipeline_events(
             data=extraction_output,
         )
 
-        client = AsyncOpenAI(api_key=api_key, timeout=180.0, max_retries=1)
+        client = AsyncOpenAI(api_key=api_key, base_url=base_url, timeout=180.0, max_retries=0)
 
         yield _event(
             "stage_started",
@@ -1327,7 +1636,7 @@ async def run_pipeline_events(
     except PipelineError as exc:
         yield _event("pipeline_error", message=str(exc))
     except Exception as exc:
-        yield _event("pipeline_error", message=_friendly_api_error(exc))
+        yield _event("pipeline_error", message=_friendly_api_error(exc, open_source=base_url is not None))
     finally:
         if client is not None:
             await client.close()

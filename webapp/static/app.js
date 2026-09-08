@@ -1,4 +1,4 @@
-const FALLBACK_MODELS = [
+const OPENAI_FALLBACK_MODELS = [
   "gpt-5.6-luna",
   "gpt-5.6-terra",
   "gpt-5.6-sol",
@@ -6,6 +6,12 @@ const FALLBACK_MODELS = [
   "gpt-5-mini",
   "gpt-4.1-mini",
   "gpt-4o-mini",
+];
+
+let OPEN_SOURCE_MODELS = [
+  { id: "zai.glm-5", label: "GLM 5" },
+  { id: "qwen.qwen3-vl-235b-a22b-instruct", label: "Qwen3 VL 235B A22B" },
+  { id: "meta.llama3-70b-instruct-v1:0", label: "Llama 3 70B Instruct" },
 ];
 
 const STAGE_OUTPUT_NAMES = {
@@ -23,7 +29,11 @@ function outputName(stage) {
   if (!match) return stage;
   const round = Number(match[2]);
   const phase = round === 0 ? "Initial exploration" : `Iteration ${round}`;
-  const action = { selection: "template selection", generation: "generation", evaluation: "evaluation" }[match[1]];
+  const action = {
+    selection: "template selection",
+    generation: "generation",
+    evaluation: "evaluation",
+  }[match[1]];
   return `${phase} · ${action}`;
 }
 
@@ -32,6 +42,11 @@ const paperInput = document.querySelector("#paper-input");
 const fileLabel = document.querySelector("#file-label");
 const dropzone = document.querySelector("#dropzone");
 const apiKey = document.querySelector("#api-key");
+const providerInput = document.querySelector("#provider");
+const providerTabs = [...document.querySelectorAll(".provider-tab")];
+const openSourcePanel = document.querySelector("#open-source-panel");
+const openaiPanel = document.querySelector("#openai-panel");
+const openSourceStatus = document.querySelector("#open-source-status");
 const toggleKey = document.querySelector("#toggle-key");
 const loadModelsButton = document.querySelector("#load-models");
 const modelNote = document.querySelector("#model-note");
@@ -61,11 +76,20 @@ const modelFields = {
 };
 
 const defaults = {
-  innovation: "gpt-5.6-luna",
-  concisio: "gpt-4o-mini",
-  tsa: "gpt-5.6-luna",
-  generation: "gpt-5.6-luna",
-  critic: "gpt-5.6-luna",
+  open_source: {
+    innovation: "zai.glm-5",
+    concisio: "zai.glm-5",
+    tsa: "zai.glm-5",
+    generation: "zai.glm-5",
+    critic: "qwen.qwen3-vl-235b-a22b-instruct",
+  },
+  openai: {
+    innovation: "gpt-5.6-luna",
+    concisio: "gpt-4o-mini",
+    tsa: "gpt-5.6-luna",
+    generation: "gpt-5.6-luna",
+    critic: "gpt-5.6-luna",
+  },
 };
 
 let exportData = null;
@@ -73,14 +97,76 @@ let exportStem = "scimemex";
 let stageOutputs = {};
 
 function setModels(models, preserve = false) {
+  const options = models.map((model) =>
+    typeof model === "string" ? { id: model, label: model } : model,
+  );
   Object.entries(modelFields).forEach(([stage, select]) => {
-    const desired = preserve ? select.value : defaults[stage];
-    select.replaceChildren(...models.map((model) => new Option(model, model)));
-    select.value = models.includes(desired) ? desired : models[0];
+    const desired = preserve
+      ? select.value
+      : defaults[providerInput.value][stage];
+    select.replaceChildren(
+      ...options.map((model) => new Option(model.label, model.id)),
+    );
+    select.value = options.some((model) => model.id === desired)
+      ? desired
+      : options[0].id;
   });
 }
 
-setModels(FALLBACK_MODELS);
+setModels(OPEN_SOURCE_MODELS);
+
+function selectProvider(provider) {
+  providerInput.value = provider;
+  providerTabs.forEach((tab) => {
+    const selected = tab.dataset.provider === provider;
+    tab.classList.toggle("active", selected);
+    tab.setAttribute("aria-selected", String(selected));
+    tab.tabIndex = selected ? 0 : -1;
+  });
+  openSourcePanel.hidden = provider !== "open_source";
+  openaiPanel.hidden = provider !== "openai";
+  keyError.textContent = "";
+  if (provider === "open_source") {
+    setModels(OPEN_SOURCE_MODELS);
+    modelNote.textContent =
+      "Open source models are ready. GLM 5 is the default; Qwen3 VL is the default critic.";
+  } else {
+    setModels(OPENAI_FALLBACK_MODELS);
+    modelNote.textContent =
+      "Recommended defaults are selected. Verify your key to load models available to your project.";
+  }
+}
+
+providerTabs.forEach((tab) =>
+  tab.addEventListener("click", () => selectProvider(tab.dataset.provider)),
+);
+providerTabs.forEach((tab, index) => {
+  tab.addEventListener("keydown", (event) => {
+    if (!["ArrowLeft", "ArrowRight"].includes(event.key)) return;
+    event.preventDefault();
+    const offset = event.key === "ArrowRight" ? 1 : -1;
+    const nextTab =
+      providerTabs[
+        (index + offset + providerTabs.length) % providerTabs.length
+      ];
+    selectProvider(nextTab.dataset.provider);
+    nextTab.focus();
+  });
+});
+
+fetch("/api/providers")
+  .then((response) => response.json())
+  .then((body) => {
+    if (!body.open_source?.available) {
+      openSourceStatus.textContent =
+        "This option is not configured on the server yet.";
+    } else {
+      OPEN_SOURCE_MODELS = body.open_source.models || OPEN_SOURCE_MODELS;
+      openSourceStatus.textContent = `Three Open Source Models are available.`;
+      if (providerInput.value === "open_source") setModels(OPEN_SOURCE_MODELS);
+    }
+  })
+  .catch(() => {});
 
 function showFile(file) {
   paperError.textContent = "";
@@ -122,7 +208,7 @@ toggleKey.addEventListener("click", () => {
 
 loadModelsButton.addEventListener("click", async () => {
   keyError.textContent = "";
-  if (apiKey.value.trim().length < 12) {
+  if (providerInput.value === "openai" && apiKey.value.trim().length < 12) {
     keyError.textContent = "Enter an API key first.";
     apiKey.focus();
     return;
@@ -184,7 +270,11 @@ function jsonWithoutImage(value) {
 function renderIntermediateOutputs() {
   const entries = Object.entries(stageOutputs);
   if (!entries.length) {
-    intermediateList.replaceChildren(Object.assign(document.createElement("p"), { textContent: "No intermediate outputs yet." }));
+    intermediateList.replaceChildren(
+      Object.assign(document.createElement("p"), {
+        textContent: "No intermediate outputs yet.",
+      }),
+    );
     return;
   }
   const fragment = document.createDocumentFragment();
@@ -214,7 +304,8 @@ function handleEvent(payload) {
   if (payload.event === "pipeline_completed") {
     exportData = payload.data;
     const filename = payload.data.paper.filename || "paper";
-    exportStem = filename.replace(/\.pdf$/i, "").replace(/[^a-z0-9_-]+/gi, "-") || "paper";
+    exportStem =
+      filename.replace(/\.pdf$/i, "").replace(/[^a-z0-9_-]+/gi, "-") || "paper";
     const finalMeme = payload.data.steps.final_meme;
     memeImage.src = finalMeme.image_data_url;
     memeImage.alt = `Generated ${finalMeme.template_name} scientific meme`;
@@ -262,7 +353,7 @@ function validateForm() {
     paperError.textContent = "The selected PDF is larger than 25 MB.";
     return false;
   }
-  if (apiKey.value.trim().length < 12) {
+  if (providerInput.value === "openai" && apiKey.value.trim().length < 12) {
     keyError.textContent = "Enter your OpenAI API key.";
     return false;
   }
@@ -276,13 +367,17 @@ form.addEventListener("submit", async (event) => {
   runButton.disabled = true;
   runButton.textContent = "Generating…";
   try {
-    const response = await fetch("/api/run", { method: "POST", body: new FormData(form) });
+    const response = await fetch("/api/run", {
+      method: "POST",
+      body: new FormData(form),
+    });
     if (!response.ok) {
       const body = await response.json().catch(() => ({}));
       throw new Error(body.detail || `Request failed (${response.status}).`);
     }
     await consumeNdjson(response);
-    if (!exportData) throw new Error("The response ended before a meme was generated.");
+    if (!exportData)
+      throw new Error("The response ended before a meme was generated.");
   } catch (error) {
     runStatus.textContent = "Failed";
     currentStep.textContent = "Pipeline stopped";
@@ -309,7 +404,9 @@ function downloadBlob(blob, filename) {
 downloadJson.addEventListener("click", () => {
   if (!exportData) return;
   downloadBlob(
-    new Blob([JSON.stringify(exportData, null, 2)], { type: "application/json" }),
+    new Blob([JSON.stringify(exportData, null, 2)], {
+      type: "application/json",
+    }),
     `${exportStem}-scimemex.json`,
   );
 });

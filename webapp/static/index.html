@@ -3,7 +3,10 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <meta name="description" content="Turn a scientific paper into a contrastive research meme with SciMemeX." />
+    <meta
+      name="description"
+      content="Turn a scientific paper into a contrastive research meme with SciMemeX."
+    />
     <title>SciMemeX · Paper to meme</title>
     <link rel="stylesheet" href="/styles.css" />
   </head>
@@ -17,7 +20,11 @@
     <main id="workspace">
       <section class="intro" aria-labelledby="page-title">
         <h1 id="page-title">Generate a scientific meme</h1>
-        <p>Upload a text-based research paper. SciMemeX explores, evaluates, and contrastively improves candidates while keeping the result focused on the meme.</p>
+        <p>
+          Upload a text-based research paper. SciMemeX explores, evaluates, and
+          contrastively improves candidates while keeping the result focused on
+          the meme.
+        </p>
       </section>
 
       <form id="pipeline-form" novalidate>
@@ -25,22 +32,94 @@
           <div class="field paper-field">
             <label for="paper-input">Research paper</label>
             <label class="file-input" id="dropzone" for="paper-input">
-              <input id="paper-input" name="paper" type="file" accept="application/pdf,.pdf" required />
+              <input
+                id="paper-input"
+                name="paper"
+                type="file"
+                accept="application/pdf,.pdf"
+                required
+              />
               <span id="file-label">Choose or drop a PDF</span>
               <small>25 MB maximum</small>
             </label>
             <p class="error" id="paper-error" role="alert"></p>
           </div>
 
-          <div class="field key-field">
-            <label for="api-key">OpenAI API key</label>
-            <div class="key-input">
-              <input id="api-key" name="api_key" type="password" autocomplete="off" spellcheck="false" placeholder="sk-…" required />
-              <button id="toggle-key" type="button" aria-label="Show API key" aria-pressed="false">Show</button>
+          <div class="field provider-field">
+            <span class="field-label">Model source</span>
+            <input
+              id="provider"
+              name="provider"
+              type="hidden"
+              value="open_source"
+            />
+            <div class="provider-tabs" role="tablist" aria-label="Model source">
+              <button
+                id="open-source-tab"
+                class="provider-tab active"
+                type="button"
+                role="tab"
+                aria-selected="true"
+                aria-controls="open-source-panel"
+                data-provider="open_source"
+              >
+                Open Source Models
+              </button>
+              <button
+                id="openai-tab"
+                class="provider-tab"
+                type="button"
+                role="tab"
+                aria-selected="false"
+                aria-controls="openai-panel"
+                data-provider="openai"
+              >
+                OpenAI API key
+              </button>
             </div>
-            <div class="field-note">
-              <span>Request-scoped; never stored or exported</span>
-              <button id="load-models" type="button">Verify and load models</button>
+            <div
+              id="open-source-panel"
+              class="provider-panel"
+              role="tabpanel"
+              aria-labelledby="open-source-tab"
+            >
+              <strong>Server configured</strong>
+              <span id="open-source-status"
+                >Three Open Source models are available.</span
+              >
+            </div>
+            <div
+              id="openai-panel"
+              class="provider-panel"
+              role="tabpanel"
+              aria-labelledby="openai-tab"
+              hidden
+            >
+              <label class="sr-only" for="api-key">OpenAI API key</label>
+              <div class="key-input">
+                <input
+                  id="api-key"
+                  name="api_key"
+                  type="password"
+                  autocomplete="off"
+                  spellcheck="false"
+                  placeholder="sk-…"
+                />
+                <button
+                  id="toggle-key"
+                  type="button"
+                  aria-label="Show API key"
+                  aria-pressed="false"
+                >
+                  Show
+                </button>
+              </div>
+              <div class="field-note">
+                <span>Used for this request only</span>
+                <button id="load-models" type="button">
+                  Verify and load models
+                </button>
+              </div>
             </div>
             <p class="error" id="key-error" role="alert"></p>
           </div>
@@ -49,34 +128,71 @@
         <details class="settings">
           <summary>Models and search settings</summary>
           <div class="settings-grid">
-            <label>Innovative reflections<select id="innovation-model" name="innovation_model"></select></label>
-            <label>Concisio<select id="concisio-model" name="concisio_model"></select></label>
-            <label>Template selection<select id="tsa-model" name="tsa_model"></select></label>
-            <label>Caption generation<select id="generation-model" name="generation_model"></select></label>
-            <label>Critique agents<select id="critic-model" name="critic_model"></select></label>
-            <label>TSA breadth
+            <label
+              >Innovative reflections<select
+                id="innovation-model"
+                name="innovation_model"
+              ></select
+            ></label>
+            <label
+              >Concisio<select
+                id="concisio-model"
+                name="concisio_model"
+              ></select
+            ></label>
+            <label
+              >Template selection<select
+                id="tsa-model"
+                name="tsa_model"
+              ></select
+            ></label>
+            <label
+              >Caption generation<select
+                id="generation-model"
+                name="generation_model"
+              ></select
+            ></label>
+            <label
+              >Critique agents<select
+                id="critic-model"
+                name="critic_model"
+              ></select
+            ></label>
+            <label
+              >TSA breadth
               <select name="top_k" id="top-k">
                 <option value="1">1 template</option>
                 <option value="3">3 templates</option>
                 <option value="5" selected>5 templates (paper)</option>
               </select>
             </label>
-            <label>Contrastive iterations
+            <label
+              >Contrastive iterations
               <select name="max_iterations" id="max-iterations">
                 <option value="1">1 iteration</option>
-                <option value="3">3 iterations</option>
-                <option value="6" selected>6 iterations (paper)</option>
+                <option value="3" selected>3 iterations</option>
+                <option value="6">6 iterations</option>
               </select>
             </label>
           </div>
-          <p id="model-note">Recommended defaults are selected. Verify the key to load models available to your project.</p>
+          <p id="model-note">
+            Open source models are ready. GLM 5 is the default; Qwen3 VL is the
+            default critic.
+          </p>
         </details>
 
-        <button class="run-button" id="run-button" type="submit">Generate meme</button>
+        <button class="run-button" id="run-button" type="submit">
+          Generate meme
+        </button>
         <p class="error form-error" id="form-error" role="alert"></p>
       </form>
 
-      <section class="result" id="result" aria-live="polite" aria-labelledby="result-title">
+      <section
+        class="result"
+        id="result"
+        aria-live="polite"
+        aria-labelledby="result-title"
+      >
         <div class="result-header">
           <h2 id="result-title">Result</h2>
           <div class="run-status" id="run-status">Ready</div>
@@ -87,7 +203,14 @@
             <span id="current-step">Preparing</span>
             <span id="progress-value">0%</span>
           </div>
-          <div class="progress-track" role="progressbar" aria-label="Pipeline progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+          <div
+            class="progress-track"
+            role="progressbar"
+            aria-label="Pipeline progress"
+            aria-valuemin="0"
+            aria-valuemax="100"
+            aria-valuenow="0"
+          >
             <span id="progress-fill"></span>
           </div>
         </div>
@@ -109,7 +232,9 @@
       </section>
     </main>
 
-    <footer>SciMemeX · Scientific memes should be reviewed before publication.</footer>
+    <footer>
+      SciMemeX · Scientific memes should be reviewed before publication.
+    </footer>
     <script src="/app.js" defer></script>
   </body>
 </html>

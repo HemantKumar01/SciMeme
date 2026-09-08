@@ -93,6 +93,17 @@ The web pipeline implements the new exploration–exploitation search directly f
 
 Each search round uses one generation request for all selected images. Caption text and normalized `0..1000` placement coordinates are produced together. The API key is request-scoped and is never written to the JSON output.
 
+The web interface uses three server-configured open-source models through Amazon Bedrock. Put the shared Bedrock API key in a root-level `.env` file (this file is ignored by Git):
+
+```dotenv
+OPEN_SOURCE_API_KEY=your-api-key
+BEDROCK_REGION=us-east-1
+```
+
+Available models are GLM 5 (`zai.glm-5`), Qwen3 VL 235B A22B (`qwen.qwen3-vl-235b-a22b-instruct`), and Llama 3 70B Instruct (`meta.llama3-70b-instruct-v1:0`). GLM 5 is the default for pipeline stages, while Qwen3 VL is the default critic. `BEDROCK_REGION` is optional and defaults to `us-east-1`. Users can instead select the **OpenAI API key** tab and supply their own key; that key remains request-scoped and is not stored.
+
+For a hosted deployment, configure `OPEN_SOURCE_API_KEY` as a service environment variable or secret instead of baking `.env` into the container image.
+
 ```bash
 python3 -m venv .venv-web
 source .venv-web/bin/activate
@@ -113,6 +124,3 @@ Open `http://127.0.0.1:8000`. The interface shows the current stage, progress, a
     {"iteration": 1, "fidelity": 4.5, "clarity": 2.1, "engagement": 4.0, "average": 10.6}
   ]
 }
-
-
-

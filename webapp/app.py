@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
+from typing import Literal
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -14,6 +17,21 @@ from .pipeline import MAX_PDF_BYTES, MAX_SEARCH_ITERATIONS, run_pipeline_events
 
 APP_DIR = Path(__file__).resolve().parent
 STATIC_DIR = APP_DIR / "static"
+load_dotenv(APP_DIR.parent / ".env")
+
+BEDROCK_REGION = os.getenv("BEDROCK_REGION", "us-east-1").strip()
+if not re.fullmatch(r"[a-z]{2}(?:-gov)?-[a-z]+-\d", BEDROCK_REGION):
+    raise RuntimeError("BEDROCK_REGION is invalid.")
+BUILT_IN_BASE_URL = f"https://bedrock-mantle.{BEDROCK_REGION}.api.aws/v1"
+BUILT_IN_MODEL_OPTIONS = [
+    {"id": "zai.glm-5", "label": "GLM 5"},
+    {
+        "id": "qwen.qwen3-vl-235b-a22b-instruct",
+        "label": "Qwen3 VL 235B A22B",
+    },
+    {"id": "meta.llama3-70b-instruct-v1:0", "label": "Llama 3 70B Instruct"},
+]
+BUILT_IN_MODELS = [option["id"] for option in BUILT_IN_MODEL_OPTIONS]
 MODEL_EXCLUSIONS = (
     "audio",
     "realtime",
@@ -40,7 +58,7 @@ PREFERRED_MODELS = [
 app = FastAPI(
     title="SciMemeX Studio",
     description="Generate a scientific meme from a research-paper PDF.",
-    version="3.0.0",
+    version="3.1.0",
 )
 
 
@@ -63,6 +81,23 @@ def _sort_models(model_ids: list[str]) -> list[str]:
 @app.get("/api/health")
 async def health() -> dict[str, str]:
     return {"status": "ok", "scope": "exploration_exploitation_through_final_meme"}
+
+
+def _bedrock_api_key() -> str:
+    return os.getenv("OPEN_SOURCE_API_KEY", "").strip()
+
+
+@app.get("/api/providers")
+async def providers() -> dict[str, object]:
+    return {
+        "default_provider": "open_source",
+        "open_source": {
+            "available": bool(_bedrock_api_key()),
+            "provider": "Amazon Bedrock",
+            "region": BEDROCK_REGION,
+            "models": BUILT_IN_MODEL_OPTIONS,
+        },
+    }
 
 
 @app.post("/api/models")
@@ -92,7 +127,8 @@ async def list_models(request: ModelRequest) -> dict[str, list[str]]:
 @app.post("/api/run")
 async def run_pipeline(
     paper: UploadFile = File(...),
-    api_key: str = Form(..., min_length=12, max_length=500),
+    provider: Literal["open_source", "openai"] = Form("open_source"),
+    api_key: str = Form("", max_length=500),
     innovation_model: str = Form(..., min_length=2, max_length=100),
     concisio_model: str = Form(..., min_length=2, max_length=100),
     tsa_model: str = Form(..., min_length=2, max_length=100),
@@ -108,10 +144,29 @@ async def run_pipeline(
     if len(contents) > MAX_PDF_BYTES:
         raise HTTPException(status_code=413, detail="The PDF exceeds the 25 MB upload limit.")
 
+    base_url: str | None = None
+    if provider == "open_source":
+        selected_models = {innovation_model, concisio_model, tsa_model, generation_model, critic_model}
+        unsupported_models = selected_models.difference(BUILT_IN_MODELS)
+        if unsupported_models:
+            raise HTTPException(status_code=422, detail="Choose a model available in the AWS Bedrock models tab.")
+        api_key = _bedrock_api_key()
+        if not api_key:
+            raise HTTPException(
+                status_code=503,
+                detail="Amazon Bedrock is not configured on this server. Set OPEN_SOURCE_API_KEY in .env.",
+            )
+        base_url = BUILT_IN_BASE_URL
+    elif len(api_key.strip()) < 12:
+        raise HTTPException(status_code=422, detail="Enter your OpenAI API key.")
+    else:
+        api_key = api_key.strip()
+
     events = run_pipeline_events(
         pdf_bytes=contents,
         filename=Path(paper.filename or "paper.pdf").name,
         api_key=api_key,
+        base_url=base_url,
         innovation_model=innovation_model,
         concisio_model=concisio_model,
         tsa_model=tsa_model,
