@@ -77,11 +77,11 @@ const modelFields = {
 
 const defaults = {
   open_source: {
-    innovation: "zai.glm-5",
-    concisio: "zai.glm-5",
-    tsa: "zai.glm-5",
-    generation: "zai.glm-5",
-    critic: "qwen.qwen3-vl-235b-a22b-instruct",
+    innovation: "qwen.qwen3-vl-235b-a22b-instruct",
+    concisio: "qwen.qwen3-vl-235b-a22b-instruct",
+    tsa: "qwen.qwen3-vl-235b-a22b-instruct",
+    generation: "qwen.qwen3-vl-235b-a22b-instruct",
+    critic: "zai.glm-5",
   },
   openai: {
     innovation: "gpt-5.6-luna",
@@ -129,7 +129,7 @@ function selectProvider(provider) {
   if (provider === "open_source") {
     setModels(OPEN_SOURCE_MODELS);
     modelNote.textContent =
-      "Open source models are ready. GLM 5 is the default; Qwen3 VL is the default critic.";
+      "AWS Bedrock models are ready. Qwen3 VL is the default; GLM 5 is the default critic.";
   } else {
     setModels(OPENAI_FALLBACK_MODELS);
     modelNote.textContent =

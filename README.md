@@ -100,7 +100,7 @@ OPEN_SOURCE_API_KEY=your-api-key
 BEDROCK_REGION=us-east-1
 ```
 
-Available models are GLM 5 (`zai.glm-5`), Qwen3 VL 235B A22B (`qwen.qwen3-vl-235b-a22b-instruct`), and Llama 3 70B Instruct (`meta.llama3-70b-instruct-v1:0`). GLM 5 is the default for pipeline stages, while Qwen3 VL is the default critic. `BEDROCK_REGION` is optional and defaults to `us-east-1`. Users can instead select the **OpenAI API key** tab and supply their own key; that key remains request-scoped and is not stored.
+Available models are GLM 5 (`zai.glm-5`), Qwen3 VL 235B A22B (`qwen.qwen3-vl-235b-a22b-instruct`), and Llama 3 70B Instruct (`meta.llama3-70b-instruct-v1:0`). Qwen3 VL is the default for pipeline stages, while GLM 5 is the default critic. `BEDROCK_REGION` is optional and defaults to `us-east-1`. Users can instead select the **OpenAI API key** tab and supply their own key; that key remains request-scoped and is not stored.
 
 For a hosted deployment, configure `OPEN_SOURCE_API_KEY` as a service environment variable or secret instead of baking `.env` into the container image.
 
