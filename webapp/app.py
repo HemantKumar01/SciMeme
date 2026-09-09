@@ -14,7 +14,6 @@ from pydantic import BaseModel, Field
 
 from .pipeline import MAX_PDF_BYTES, MAX_SEARCH_ITERATIONS, run_pipeline_events
 
-
 APP_DIR = Path(__file__).resolve().parent
 STATIC_DIR = APP_DIR / "static"
 load_dotenv(APP_DIR.parent / ".env")
@@ -70,12 +69,16 @@ def _is_text_model(model_id: str) -> bool:
     lowered = model_id.casefold()
     if any(excluded in lowered for excluded in MODEL_EXCLUSIONS):
         return False
-    return bool(re.match(r"^(?:gpt-(?:4o|4\.1|5|6)(?:[-.]|$)|o[34](?:[-.]|$))", lowered))
+    return bool(
+        re.match(r"^(?:gpt-(?:4o|4\.1|5|6)(?:[-.]|$)|o[34](?:[-.]|$))", lowered)
+    )
 
 
 def _sort_models(model_ids: list[str]) -> list[str]:
     order = {model: index for index, model in enumerate(PREFERRED_MODELS)}
-    return sorted(set(model_ids), key=lambda model: (order.get(model, len(order)), model))
+    return sorted(
+        set(model_ids), key=lambda model: (order.get(model, len(order)), model)
+    )
 
 
 @app.get("/api/health")
@@ -105,9 +108,14 @@ async def list_models(request: ModelRequest) -> dict[str, list[str]]:
     client = AsyncOpenAI(api_key=request.api_key, timeout=30.0, max_retries=0)
     try:
         page = await client.models.list()
-        models = _sort_models([item.id for item in page.data if _is_text_model(item.id)])
+        models = _sort_models(
+            [item.id for item in page.data if _is_text_model(item.id)]
+        )
         if not models:
-            raise HTTPException(status_code=502, detail="No compatible text models were found for this key.")
+            raise HTTPException(
+                status_code=502,
+                detail="No compatible text models were found for this key.",
+            )
         return {"models": models}
     except HTTPException:
         raise
@@ -119,7 +127,9 @@ async def list_models(request: ModelRequest) -> dict[str, list[str]]:
             detail = "OpenAI rate or quota limits were reached. Check project billing and retry."
         else:
             detail = "The OpenAI model list could not be loaded. Check the key and network, then retry."
-        raise HTTPException(status_code=status if status in {401, 429} else 502, detail=detail) from exc
+        raise HTTPException(
+            status_code=status if status in {401, 429} else 502, detail=detail
+        ) from exc
     finally:
         await client.close()
 
@@ -137,19 +147,32 @@ async def run_pipeline(
     top_k: int = Form(5, ge=1, le=5),
     max_iterations: int = Form(MAX_SEARCH_ITERATIONS, ge=1, le=MAX_SEARCH_ITERATIONS),
 ) -> StreamingResponse:
-    if paper.content_type not in {"application/pdf", "application/x-pdf"} and not (paper.filename or "").lower().endswith(".pdf"):
+    if paper.content_type not in {"application/pdf", "application/x-pdf"} and not (
+        paper.filename or ""
+    ).lower().endswith(".pdf"):
         raise HTTPException(status_code=415, detail="Upload a PDF file.")
     contents = await paper.read(MAX_PDF_BYTES + 1)
     await paper.close()
     if len(contents) > MAX_PDF_BYTES:
-        raise HTTPException(status_code=413, detail="The PDF exceeds the 25 MB upload limit.")
+        raise HTTPException(
+            status_code=413, detail="The PDF exceeds the 25 MB upload limit."
+        )
 
     base_url: str | None = None
     if provider == "open_source":
-        selected_models = {innovation_model, concisio_model, tsa_model, generation_model, critic_model}
+        selected_models = {
+            innovation_model,
+            concisio_model,
+            tsa_model,
+            generation_model,
+            critic_model,
+        }
         unsupported_models = selected_models.difference(BUILT_IN_MODELS)
         if unsupported_models:
-            raise HTTPException(status_code=422, detail="Choose a model available in the AWS Bedrock models tab.")
+            raise HTTPException(
+                status_code=422,
+                detail="Choose a model available in the open source models tab.",
+            )
         api_key = _bedrock_api_key()
         if not api_key:
             raise HTTPException(

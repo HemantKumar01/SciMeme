@@ -129,7 +129,7 @@ function selectProvider(provider) {
   if (provider === "open_source") {
     setModels(OPEN_SOURCE_MODELS);
     modelNote.textContent =
-      "AWS Bedrock models are ready. Qwen3 VL is the default; GLM 5 is the default critic.";
+      "Open Source Models models are ready. Qwen3 VL is the default; GLM 5 is the default critic.";
   } else {
     setModels(OPENAI_FALLBACK_MODELS);
     modelNote.textContent =
